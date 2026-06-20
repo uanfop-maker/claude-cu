@@ -5,13 +5,15 @@ import subprocess
 import secrets
 from contextlib import asynccontextmanager
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright, Browser, Page
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route, Mount
+from starlette.routing import Route, BaseRoute, Match
+from starlette.types import Scope, Receive, Send, ASGIApp
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("MCP_API_KEY", "")
@@ -43,7 +45,7 @@ async def get_page() -> Page:
             _page = await _browser.new_page(viewport={"width": 1280, "height": 900})
     return _page
 
-# ── MCP Server ───────────────────────────────────────────────────────────────
+# ── MCP tools ────────────────────────────────────────────────────────────────
 mcp = FastMCP("claude-cu")
 
 
@@ -113,7 +115,7 @@ async def bash(command: str) -> dict:
 # ── Auth middleware ──────────────────────────────────────────────────────────
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in ("/health", "/"):
+        if request.url.path in ("/health",):
             return await call_next(request)
         key = request.headers.get("x-api-key", "")
         if key != API_KEY:
@@ -122,17 +124,55 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ── Build app: mount MCP at root so /mcp is handled by FastMCP internally ───
+# ── Health endpoint ───────────────────────────────────────────────────────────
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "api_key_set": bool(API_KEY)})
 
-# FastMCP's streamable_http_app registers routes at /mcp and /mcp/
-mcp_asgi = mcp.streamable_http_app()
+
+# ── Lifespan: start MCP session manager ──────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        yield
+
+
+# ── Custom route: mounts MCP handler at /mcp without redirect ────────────────
+class McpRoute(BaseRoute):
+    def __init__(self, path: str, app: ASGIApp):
+        self.path = path
+        self.app = app
+
+    def matches(self, scope: Scope):
+        path = scope.get("path", "")
+        if path == self.path or path.startswith(self.path + "/"):
+            return Match.FULL, {}
+        return Match.NONE, {}
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send):
+        scope = dict(scope)
+        orig = scope.get("path", "")
+        if orig == self.path:
+            scope["path"] = "/"
+        elif orig.startswith(self.path + "/"):
+            scope["path"] = orig[len(self.path):]
+        scope["raw_path"] = scope["path"].encode()
+        await self.app(scope, receive, send)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        await self.handle(scope, receive, send)
+
+    def url_path_for(self, name: str, **path_params):
+        raise NotImplementedError
+
+
+# ── Build app ─────────────────────────────────────────────────────────────────
+_mcp_handler = mcp.streamable_http_app().routes[0].app
 
 app = Starlette(
+    lifespan=lifespan,
     routes=[
         Route("/health", health),
-        Mount("/", app=mcp_asgi),
-    ]
+        McpRoute("/mcp", _mcp_handler),
+    ],
 )
 app.add_middleware(ApiKeyMiddleware)
