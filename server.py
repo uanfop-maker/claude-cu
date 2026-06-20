@@ -3,13 +3,15 @@ import base64
 import os
 import subprocess
 import secrets
-from typing import Any
+from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright, Browser, Page
+from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route, Mount
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("MCP_API_KEY", "")
@@ -50,8 +52,7 @@ async def screenshot() -> str:
     """Take a screenshot of the current browser page. Returns base64-encoded PNG."""
     page = await get_page()
     buf = await page.screenshot(type="png")
-    b64 = base64.b64encode(buf).decode()
-    return f"data:image/png;base64,{b64}"
+    return base64.b64encode(buf).decode()
 
 
 @mcp.tool()
@@ -112,7 +113,7 @@ async def bash(command: str) -> dict:
 # ── Auth middleware ──────────────────────────────────────────────────────────
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        if request.url.path in ("/health", "/"):
             return await call_next(request)
         key = request.headers.get("x-api-key", "")
         if key != API_KEY:
@@ -121,18 +122,17 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ── ASGI App ─────────────────────────────────────────────────────────────────
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.responses import JSONResponse
-
-async def health(request):
+# ── Build app: mount MCP at root so /mcp is handled by FastMCP internally ───
+async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "api_key_set": bool(API_KEY)})
 
-mcp_app = mcp.streamable_http_app()
+# FastMCP's streamable_http_app registers routes at /mcp and /mcp/
+mcp_asgi = mcp.streamable_http_app()
 
-app = Starlette(routes=[
-    Route("/health", health),
-    Mount("/mcp", app=mcp_app),
-])
+app = Starlette(
+    routes=[
+        Route("/health", health),
+        Mount("/", app=mcp_asgi),
+    ]
+)
 app.add_middleware(ApiKeyMiddleware)
