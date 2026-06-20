@@ -1,4 +1,6 @@
+mcp[cli]==1.9.0
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 playwright==1.49.0
 pydantic==2.10.3
+starlette==0.41.3

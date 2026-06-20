@@ -3,22 +3,19 @@ import base64
 import os
 import subprocess
 import secrets
-from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright, Browser, Page
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("MCP_API_KEY", "")
 if not API_KEY:
     API_KEY = secrets.token_urlsafe(32)
     print(f"[claude-cu] Generated API key: {API_KEY}", flush=True)
-
-def check_auth(x_api_key: str = Header(default="")):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 # ── Browser singleton ───────────────────────────────────────────────────────
 _pw = None
@@ -44,90 +41,66 @@ async def get_page() -> Page:
             _page = await _browser.new_page(viewport={"width": 1280, "height": 900})
     return _page
 
-# ── App ─────────────────────────────────────────────────────────────────────
-app = FastAPI(title="claude-cu MCP server")
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "api_key_set": bool(API_KEY)}
+# ── MCP Server ───────────────────────────────────────────────────────────────
+mcp = FastMCP("claude-cu")
 
 
-# ── MCP tool models ─────────────────────────────────────────────────────────
-class NavigateReq(BaseModel):
-    url: str
-
-class ClickReq(BaseModel):
-    x: int
-    y: int
-
-class TypeReq(BaseModel):
-    text: str
-
-class ScrollReq(BaseModel):
-    x: int
-    y: int
-    delta_y: int = 300
-
-class BashReq(BaseModel):
-    command: str
-
-
-# ── Tools ───────────────────────────────────────────────────────────────────
-@app.post("/tools/screenshot")
-async def screenshot(x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def screenshot() -> str:
+    """Take a screenshot of the current browser page. Returns base64-encoded PNG."""
     page = await get_page()
     buf = await page.screenshot(type="png")
-    return {"image_b64": base64.b64encode(buf).decode(), "content_type": "image/png"}
+    b64 = base64.b64encode(buf).decode()
+    return f"data:image/png;base64,{b64}"
 
 
-@app.post("/tools/navigate")
-async def navigate(req: NavigateReq, x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def navigate(url: str) -> dict:
+    """Navigate the browser to a URL."""
     page = await get_page()
-    await page.goto(req.url, wait_until="domcontentloaded", timeout=30_000)
+    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
     return {"url": page.url, "title": await page.title()}
 
 
-@app.post("/tools/click")
-async def click(req: ClickReq, x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def click(x: int, y: int) -> dict:
+    """Click at pixel coordinates (x, y) on the current page."""
     page = await get_page()
-    await page.mouse.click(req.x, req.y)
+    await page.mouse.click(x, y)
     await page.wait_for_timeout(300)
-    return {"clicked": [req.x, req.y]}
+    return {"clicked": [x, y]}
 
 
-@app.post("/tools/type_text")
-async def type_text(req: TypeReq, x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def type_text(text: str) -> dict:
+    """Type text into the currently focused element."""
     page = await get_page()
-    await page.keyboard.type(req.text)
-    return {"typed": len(req.text)}
+    await page.keyboard.type(text)
+    return {"typed": len(text)}
 
 
-@app.post("/tools/scroll")
-async def scroll(req: ScrollReq, x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def scroll(delta_y: int = 300) -> dict:
+    """Scroll the page by delta_y pixels (positive = down, negative = up)."""
     page = await get_page()
-    await page.mouse.wheel(0, req.delta_y)
+    await page.mouse.wheel(0, delta_y)
     await page.wait_for_timeout(200)
-    return {"scrolled": req.delta_y}
+    return {"scrolled": delta_y}
 
 
-@app.post("/tools/get_page_text")
-async def get_page_text(x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def get_page_text() -> dict:
+    """Get the visible text content of the current browser page."""
     page = await get_page()
     text = await page.evaluate("() => document.body.innerText")
     return {"text": text[:50_000], "url": page.url}
 
 
-@app.post("/tools/bash")
-async def bash(req: BashReq, x_api_key: str = Header(default="")):
-    check_auth(x_api_key)
+@mcp.tool()
+async def bash(command: str) -> dict:
+    """Run a bash command on the server and return stdout/stderr."""
     result = subprocess.run(
-        req.command, shell=True, capture_output=True, text=True, timeout=60
+        command, shell=True, capture_output=True, text=True, timeout=60
     )
     return {
         "stdout": result.stdout[:10_000],
@@ -136,17 +109,30 @@ async def bash(req: BashReq, x_api_key: str = Header(default="")):
     }
 
 
-# ── MCP manifest (for claude mcp add) ────────────────────────────────────────
-@app.get("/mcp")
-async def mcp_manifest():
-    base = os.environ.get("SERVICE_URL", "http://localhost:8099")
-    tools = [
-        {"name": "screenshot",    "description": "Take a screenshot of the current browser page", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "navigate",      "description": "Navigate browser to a URL", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-        {"name": "click",         "description": "Click at (x, y) pixel coordinates", "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}},
-        {"name": "type_text",     "description": "Type text into the currently focused element", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
-        {"name": "scroll",        "description": "Scroll the page by delta_y pixels", "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "delta_y": {"type": "integer"}}}},
-        {"name": "get_page_text", "description": "Get visible text content of the current page", "inputSchema": {"type": "object", "properties": {}}},
-        {"name": "bash",          "description": "Run a bash command and return output", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    ]
-    return {"schema_version": "v1", "name": "claude-cu", "tools": tools, "base_url": base + "/tools"}
+# ── Auth middleware ──────────────────────────────────────────────────────────
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/health":
+            return await call_next(request)
+        key = request.headers.get("x-api-key", "")
+        if key != API_KEY:
+            return Response('{"detail":"Invalid API key"}', status_code=401,
+                            media_type="application/json")
+        return await call_next(request)
+
+
+# ── ASGI App ─────────────────────────────────────────────────────────────────
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import JSONResponse
+
+async def health(request):
+    return JSONResponse({"status": "ok", "api_key_set": bool(API_KEY)})
+
+mcp_app = mcp.streamable_http_app()
+
+app = Starlette(routes=[
+    Route("/health", health),
+    Mount("/mcp", app=mcp_app),
+])
+app.add_middleware(ApiKeyMiddleware)
