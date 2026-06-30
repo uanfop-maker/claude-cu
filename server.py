@@ -4,14 +4,13 @@ import os
 import subprocess
 import secrets
 
-import anyio
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright, Browser, Page
-from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route, Mount
+from starlette.applications import Starlette
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("MCP_API_KEY", "")
@@ -57,18 +56,18 @@ async def screenshot() -> str:
 
 @mcp.tool()
 async def screenshot_display() -> str:
-    """Take a full virtual display screenshot (captures all windows, not just browser). Returns base64-encoded PNG."""
+    """Take a full virtual display screenshot (all windows). Returns base64-encoded PNG."""
     result = subprocess.run(
-        "import -window root /tmp/display_screenshot.png && base64 /tmp/display_screenshot.png",
+        "scrot /tmp/display_screenshot.png && base64 /tmp/display_screenshot.png",
         shell=True, capture_output=True, text=True, timeout=10,
         env={**os.environ, "DISPLAY": ":99"}
     )
     if result.returncode == 0:
         return result.stdout.strip()
-    # Fallback: xwd
     result2 = subprocess.run(
-        "xwd -root -silent -display :99 | convert xwd:- png:- | base64",
-        shell=True, capture_output=True, text=True, timeout=10
+        "import -window root /tmp/disp.png && base64 /tmp/disp.png",
+        shell=True, capture_output=True, text=True, timeout=10,
+        env={**os.environ, "DISPLAY": ":99"}
     )
     if result2.returncode == 0:
         return result2.stdout.strip()
@@ -133,7 +132,7 @@ async def bash(command: str) -> dict:
 
 @mcp.tool()
 async def xdotool(args: str) -> dict:
-    """Run xdotool command for GUI automation (click, type, key, getactivewindow, etc)."""
+    """Run xdotool command for GUI automation on the virtual display."""
     result = subprocess.run(
         f"xdotool {args}",
         shell=True, capture_output=True, text=True, timeout=30,
@@ -163,7 +162,8 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "api_key_set": bool(API_KEY)})
 
 
-# ── Build app: Mount MCP sub-app so its lifespan is properly called ───────────
+# ── Build app ─────────────────────────────────────────────────────────────────
+# Use mcp.streamable_http_app() as the base; add health + auth on top
 mcp_sub_app = mcp.streamable_http_app()
 
 app = Starlette(
@@ -171,5 +171,6 @@ app = Starlette(
         Route("/health", health),
         Mount("/mcp", app=mcp_sub_app),
     ],
+    redirect_slashes=False,
 )
 app.add_middleware(ApiKeyMiddleware)
