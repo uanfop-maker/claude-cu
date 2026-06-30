@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium chromium-driver \
     xvfb \
+    imagemagick x11-apps scrot xdotool \
     fonts-liberation fonts-noto-cjk \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -14,8 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && playwright install-deps chromium 2>/dev/null || true
+RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install-deps chromium 2>/dev/null || true
 
 COPY . .
 
