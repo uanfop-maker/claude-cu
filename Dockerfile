@@ -9,8 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     imagemagick x11-apps scrot xdotool \
     fonts-liberation fonts-noto-cjk \
-    ca-certificates curl \
+    ca-certificates curl wget \
+    libgtk-3-0 libpolkit-gobject-1-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Install AnyDesk
+RUN wget -q -O /tmp/anydesk.deb "https://download.anydesk.com/linux/anydesk_6.4.3-1_amd64.deb" \
+    && dpkg -i /tmp/anydesk.deb 2>&1 || true \
+    && rm /tmp/anydesk.deb
 
 WORKDIR /app
 
